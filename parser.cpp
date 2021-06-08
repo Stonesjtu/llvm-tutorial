@@ -187,6 +187,10 @@ static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<IRBuilder<>> Builder;
 static std::unique_ptr<Module> TheModule;
 static std::map<std::string, Value *> NamedValues;
+static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static ExitOnError ExitOnErr;
+
 
 Value *LogErrorV(const char *Str) {
   LogError(Str);
@@ -267,11 +271,12 @@ Function *FunctionAST::codegen() {
   Builder->SetInsertPoint(BB);
   NamedValues.clear();
   for (auto &Arg : TheFunction->args())
-    NamedValues[Arg.getName()] = &Arg;
+    NamedValues[std::string(Arg.getName())] = &Arg;
 
   if (Value *RetVal = Body->codegen()) {
     Builder->CreateRet(RetVal);
     verifyFunction(*TheFunction);
+    TheFPM->run(*TheFunction);
     return TheFunction;
   }
   TheFunction->eraseFromParent();
@@ -282,6 +287,15 @@ Function *FunctionAST::codegen() {
 static void InitializeModule() {
   TheContext = std::make_unique<LLVMContext>();
   TheModule = std::make_unique<Module>("my cool JITTT", *TheContext);
+  // TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
+  TheModule->setDataLayout(TheJIT->getDataLayout());
+  TheFPM = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
+
+  TheFPM->add(createInstructionCombiningPass());
+  TheFPM->add(createReassociatePass());
+  TheFPM->add(createGVNPass());
+  TheFPM->add(createCFGSimplificationPass());
+  TheFPM->doInitialization();
 
   Builder = std::make_unique<IRBuilder<>>(*TheContext);
 }
@@ -313,10 +327,22 @@ static void HandleExtern() {
 static void HandleTopLevelExpression() {
   if (auto ExAST = ParseTopLevelExpr()) {
     if (auto *ExIR = ExAST->codegen()) {
-      fprintf(stderr, "Parsed an expression: ");
-      ExIR->print(errs());
-      fprintf(stderr, "\n");
-      ExIR->eraseFromParent();
+      // Create a ResourceTracker to track JIT'd memory allocated to our
+      // anonymous expression -- that way we can free it after executing.
+      auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+
+      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+      InitializeModule();
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+      assert(ExprSymbol && "Function not found");
+      double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
+
+      fprintf(stderr, "Evaluated: %f\n", FP());
+      // TheJIT->removeModule(H);
+      // Delete the anonymous expression module from the JIT.
+      ExitOnErr(RT->remove());
     }
   } else {
     getNextToken();
@@ -348,6 +374,10 @@ static void MainLoop() {
 
 int main() {
   // Install std binary operators
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+  TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
   BinopPrecedence['-'] = 20;
